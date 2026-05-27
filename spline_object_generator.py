@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 13, 0),
+    "version": (1, 13, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多实例、多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -553,6 +553,19 @@ def sample_curve_headtail_by_distance(curve_obj, spacing, max_count,
                     tans.append(tan_world)
                     count_loop += 1
                 current_dist += spacing
+        elif max_count > 0:
+            # 间距为0：在头尾之间按数量均匀分布循环体
+            segment = tail_dist - head_dist
+            if max_count == 1:
+                positions = [head_dist + segment * 0.5]
+            else:
+                step = segment / (max_count + 1)
+                positions = [head_dist + step * (i + 1) for i in range(max_count)]
+            for pos in positions:
+                pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, pos, mat, mat3)
+                if pt_world is not None:
+                    pts.append(pt_world)
+                    tans.append(tan_world)
 
         # 尾部固定
         pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, tail_dist, mat, mat3)
