@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 12, 2),
+    "version": (1, 12, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -541,8 +541,8 @@ def sample_curve_headtail_by_distance(curve_obj, spacing, max_count,
         if spacing > 0.0001:
             current_dist = head_dist + spacing
             count_loop = 0
-            # 最多放置 max_count-2 个中间物体（减去头尾）
-            while current_dist < tail_dist and count_loop < max_count - 2:
+            # max_count 只表示循环体数量（头尾额外固定放置）
+            while current_dist < tail_dist and count_loop < max_count:
                 pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, current_dist, mat, mat3)
                 if pt_world is not None:
                     pts.append(pt_world)
@@ -681,6 +681,13 @@ def _get_curve_state_hash(curve_obj):
                 for p in spline.points:
                     h.update(f"{p.co.x:.4f},{p.co.y:.4f},{p.co.z:.4f},{p.co.w:.4f}".encode())
         h.update(f"resolu:{data.resolution_u}".encode())
+        # 同时检测物体的位置/旋转/缩放变化
+        loc = curve_obj.location
+        rot = curve_obj.rotation_euler
+        scl = curve_obj.scale
+        h.update(f"loc:{loc.x:.4f},{loc.y:.4f},{loc.z:.4f}".encode())
+        h.update(f"rot:{rot.x:.4f},{rot.y:.4f},{rot.z:.4f}".encode())
+        h.update(f"scl:{scl.x:.4f},{scl.y:.4f},{scl.z:.4f}".encode())
         return h.hexdigest()
     except Exception:
         return None
