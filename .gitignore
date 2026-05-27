@@ -1,1 +1,5 @@
 .workbuddy/
+*.bak
+*_tmp_*.py
+fix_*.py
+gen_spline.py
