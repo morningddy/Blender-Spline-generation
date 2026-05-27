@@ -1,10 +1,10 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 12, 3),
+    "version": (1, 13, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
-    "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
+    "description": "沿样条线实时生成物体，支持多实例、多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
     "category": "Object",
 }
 
@@ -21,7 +21,7 @@ from mathutils import Vector, Matrix, Quaternion, Euler
 _preview_timer = None
 _is_updating = False
 _bind_timer_active = False
-_last_curve_state = {}
+_last_curve_state = {}  # key: (instance_index, obj_pointer)
 
 
 class SplineSourceItem(bpy.types.PropertyGroup):
@@ -47,6 +47,11 @@ class SplineTargetItem(bpy.types.PropertyGroup):
 
 
 class SplineGenProperties(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(
+        name="名称",
+        default="生成器",
+        description="此生成器实例的名称",
+    )
     target_curves: bpy.props.CollectionProperty(type=SplineTargetItem)
     target_curve_index: bpy.props.IntProperty(default=-1)
 
@@ -324,7 +329,7 @@ class SplineGenProperties(bpy.types.PropertyGroup):
     bind_to_curve: bpy.props.BoolProperty(
         name="绑定曲线",
         default=False,
-        update=lambda self, context: _on_bind_toggle(context),
+        update=lambda self, context: _on_bind_toggle(context, self),
     )
     generated_objects: bpy.props.CollectionProperty(type=GeneratedObjectItem)
 
@@ -340,7 +345,6 @@ def _get_all_chains(mesh):
     if len(mesh.edges) == 0:
         return []
 
-    # 构建邻接表
     adj = {}
     for e in mesh.edges:
         a, b = e.vertices[0], e.vertices[1]
@@ -696,9 +700,19 @@ def _get_curve_state_hash(curve_obj):
 # ---------------------------------------------------------------------------
 # 实时预览去抖
 # ---------------------------------------------------------------------------
+def _get_active_instance(context):
+    """获取当前选中的生成器实例，未选中返回 None。"""
+    idx = context.scene.spline_gen_instance_index
+    instances = context.scene.spline_gen_instances
+    if 0 <= idx < len(instances):
+        return instances[idx]
+    return None
+
+
 def _schedule_preview(context):
     global _preview_timer
-    props = context.scene.spline_gen if hasattr(context.scene, 'spline_gen') else None
+    # 只预览当前选中的实例
+    props = _get_active_instance(context)
     if props is None or not props.auto_update:
         return
     if _preview_timer is not None:
@@ -713,7 +727,7 @@ def _do_preview():
     global _preview_timer
     _preview_timer = None
     try:
-        _generate_direct()
+        _generate_direct(selected_only=True)
     except Exception:
         pass
     return None
@@ -725,14 +739,17 @@ def _on_curve_changed(context):
     _schedule_preview(context)
 
 
-def _on_bind_toggle(context):
-    props = context.scene.spline_gen
+def _on_bind_toggle(context, props):
+    """当某个实例的绑定曲线开关变化时调用。"""
     global _bind_timer_active
-    if props.bind_to_curve:
-        _last_curve_state.clear()
-        _bind_timer_active = True
-    else:
-        _bind_timer_active = False
+    # 检查是否有任何实例开启了绑定
+    any_bound = False
+    for scene in bpy.data.scenes:
+        for inst in scene.spline_gen_instances:
+            if inst.bind_to_curve:
+                any_bound = True
+                break
+    _bind_timer_active = any_bound
 
 
 # ---------------------------------------------------------------------------
@@ -746,32 +763,35 @@ def _bind_timer_callback():
         return 0.1
     changed = False
     for scene in bpy.data.scenes:
-        if not hasattr(scene, 'spline_gen'):
+        if not hasattr(scene, 'spline_gen_instances'):
             continue
-        props = scene.spline_gen
-        if not props.bind_to_curve:
-            continue
-        for item in props.target_curves:
-            curve = item.curve
-            if curve is None or curve.type != 'CURVE':
+        for inst_idx, props in enumerate(scene.spline_gen_instances):
+            if not props.bind_to_curve:
                 continue
-            new_hash = _get_curve_state_hash(curve)
-            obj_id = curve.as_pointer()
-            old_hash = _last_curve_state.get(obj_id)
-            if new_hash is not None and new_hash != old_hash:
-                _last_curve_state[obj_id] = new_hash
-                changed = True
+            for item in props.target_curves:
+                curve = item.curve
+                if curve is None or curve.type != 'CURVE':
+                    continue
+                new_hash = _get_curve_state_hash(curve)
+                key = (inst_idx, curve.as_pointer())
+                old_hash = _last_curve_state.get(key)
+                if new_hash is not None and new_hash != old_hash:
+                    _last_curve_state[key] = new_hash
+                    changed = True
     if changed:
         def _delayed_gen():
             try:
-                _generate_direct()
+                _generate_direct(selected_only=False)
             except Exception:
                 pass
             return None
         bpy.app.timers.register(_delayed_gen, first_interval=0.05)
     # 清理已不存在对象的哈希
     existing_ids = {obj.as_pointer() for obj in bpy.data.objects}
-    _last_curve_state = {k: v for k, v in _last_curve_state.items() if k in existing_ids}
+    _last_curve_state = {
+        k: v for k, v in _last_curve_state.items()
+        if k[1] in existing_ids
+    }
     return 0.1
 
 
@@ -812,48 +832,58 @@ def _clear_generated(props):
         _is_updating = False
 
 
-def _generate_direct():
+def _generate_direct(selected_only=False):
     global _is_updating
     if _is_updating:
         return
     for scene in bpy.data.scenes:
-        if not hasattr(scene, 'spline_gen'):
+        if not hasattr(scene, 'spline_gen_instances'):
             continue
-        props = scene.spline_gen
-        curves = [item.curve for item in props.target_curves
-                  if item.curve is not None and item.curve.type == 'CURVE']
-        if not curves:
-            continue
-        result = _collect_source(props)
-        if result is None:
-            continue
-        source_list, has_headtail = result
-
         _is_updating = True
         try:
-            _clear_generated(props)
-            total_count = 0
-            for curve in curves:
-                if has_headtail:
-                    chain_results = sample_curve_headtail_by_distance(
-                        curve, props.spacing, props.count,
-                        props.head_offset, props.tail_offset,
-                    )
-                else:
-                    offset_start = props.offset_start
-                    offset_end = props.offset_end
-                    chain_results = sample_curve_by_distance(
-                        curve, props.spacing, props.count,
-                        offset_start, offset_end,
-                    )
-                for pts, tans in chain_results:
-                    if not pts:
-                        continue
-                    _place_objects(props, source_list, pts, tans, has_headtail)
-                    total_count += len(pts)
+            if selected_only:
+                idx = scene.spline_gen_instance_index
+                if 0 <= idx < len(scene.spline_gen_instances):
+                    _generate_for_instance(scene.spline_gen_instances[idx])
+            else:
+                for props in scene.spline_gen_instances:
+                    _generate_for_instance(props)
         finally:
             _is_updating = False
         break
+
+
+def _generate_for_instance(props):
+    """对单个生成器实例执行生成。"""
+    curves = [item.curve for item in props.target_curves
+              if item.curve is not None and item.curve.type == 'CURVE']
+    if not curves:
+        return
+    result = _collect_source(props)
+    if result is None:
+        return
+    source_list, has_headtail = result
+
+    _clear_generated(props)
+    total_count = 0
+    for curve in curves:
+        if has_headtail:
+            chain_results = sample_curve_headtail_by_distance(
+                curve, props.spacing, props.count,
+                props.head_offset, props.tail_offset,
+            )
+        else:
+            offset_start = props.offset_start
+            offset_end = props.offset_end
+            chain_results = sample_curve_by_distance(
+                curve, props.spacing, props.count,
+                offset_start, offset_end,
+            )
+        for pts, tans in chain_results:
+            if not pts:
+                continue
+            _place_objects(props, source_list, pts, tans, has_headtail)
+            total_count += len(pts)
 
 
 def _place_objects(props, source_list, points, tangents, has_headtail=False):
@@ -893,11 +923,9 @@ def _place_objects(props, source_list, points, tangents, has_headtail=False):
         is_tail = (has_headtail and i == len(points) - 1 and props.tail_object is not None)
 
         if is_head:
-            # 头部模型：应用固定旋转，不参与随机旋转
             head_euler = Euler(props.head_rotation)
             final_quat = final_quat @ head_euler.to_quaternion()
         elif is_tail:
-            # 尾部模型：应用固定旋转，不参与随机旋转
             tail_euler = Euler(props.tail_rotation)
             final_quat = final_quat @ tail_euler.to_quaternion()
         elif props.random_rotation > 0:
@@ -949,13 +977,10 @@ def _place_objects(props, source_list, points, tangents, has_headtail=False):
         is_tail = (has_headtail and i == len(points) - 1 and props.tail_object is not None)
 
         if is_head:
-            # 头部模型：使用独立三轴缩放，不参与随机缩放
             new_obj.scale = props.head_scale[:]
         elif is_tail:
-            # 尾部模型：使用独立三轴缩放，不参与随机缩放
             new_obj.scale = props.tail_scale[:]
         else:
-            # 循环体：使用基础三轴缩放，可叠加随机缩放
             bs = props.base_scale
             if props.use_random_scale:
                 if props.uniform_scale:
@@ -989,6 +1014,40 @@ def _random_rotation(max_angle_rad):
 # ---------------------------------------------------------------------------
 # Operators
 # ---------------------------------------------------------------------------
+class SPLINE_OT_add_instance(bpy.types.Operator):
+    bl_idname = "spline.add_instance"
+    bl_label = "添加生成器"
+    bl_options = {'INTERNAL', 'UNDO'}
+
+    def execute(self, context):
+        instances = context.scene.spline_gen_instances
+        item = instances.add()
+        idx = len(instances) - 1
+        item.name = f"生成器 {idx + 1}"
+        context.scene.spline_gen_instance_index = idx
+        return {'FINISHED'}
+
+
+class SPLINE_OT_remove_instance(bpy.types.Operator):
+    bl_idname = "spline.remove_instance"
+    bl_label = "移除生成器"
+    bl_options = {'INTERNAL', 'UNDO'}
+
+    index: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        instances = context.scene.spline_gen_instances
+        idx = self.index
+        if 0 <= idx < len(instances):
+            # 先清除该实例生成的物体
+            props = instances[idx]
+            _clear_generated(props)
+            instances.remove(idx)
+            if context.scene.spline_gen_instance_index >= len(instances):
+                context.scene.spline_gen_instance_index = max(0, len(instances) - 1)
+        return {'FINISHED'}
+
+
 class SPLINE_OT_generate(bpy.types.Operator):
     bl_idname = "spline.generate"
     bl_label = "生成"
@@ -1005,42 +1064,43 @@ class SPLINE_OT_generate(bpy.types.Operator):
         if _is_updating:
             return {'CANCELLED'}
 
-        props = context.scene.spline_gen
-        curves = [item.curve for item in props.target_curves
-                  if item.curve is not None and item.curve.type == 'CURVE']
-        if not curves:
-            self.report({'ERROR'}, "请先设置目标曲线！")
+        instances = context.scene.spline_gen_instances
+        if len(instances) == 0:
+            self.report({'ERROR'}, "请先添加一个生成器！")
             return {'CANCELLED'}
-
-        result = _collect_source(props)
-        if result is None:
-            self.report({'ERROR'}, "请在面板中设置源物体！")
-            return {'CANCELLED'}
-        source_list, has_headtail = result
 
         _is_updating = True
+        total_count = 0
         try:
-            _clear_generated(props)
-            total_count = 0
-            for curve in curves:
-                if has_headtail:
-                    chain_results = sample_curve_headtail_by_distance(
-                        curve, props.spacing, props.count,
-                        props.head_offset, props.tail_offset,
-                    )
-                else:
-                    offset_start = props.offset_start
-                    offset_end = props.offset_end
-                    chain_results = sample_curve_by_distance(
-                        curve, props.spacing, props.count,
-                        offset_start, offset_end,
-                    )
+            for props in instances:
+                curves = [item.curve for item in props.target_curves
+                          if item.curve is not None and item.curve.type == 'CURVE']
+                if not curves:
+                    continue
+                result = _collect_source(props)
+                if result is None:
+                    continue
+                source_list, has_headtail = result
 
-                for pts, tans in chain_results:
-                    if not pts:
-                        continue
-                    _place_objects(props, source_list, pts, tans, has_headtail)
-                    total_count += len(pts)
+                _clear_generated(props)
+                for curve in curves:
+                    if has_headtail:
+                        chain_results = sample_curve_headtail_by_distance(
+                            curve, props.spacing, props.count,
+                            props.head_offset, props.tail_offset,
+                        )
+                    else:
+                        offset_start = props.offset_start
+                        offset_end = props.offset_end
+                        chain_results = sample_curve_by_distance(
+                            curve, props.spacing, props.count,
+                            offset_start, offset_end,
+                        )
+                    for pts, tans in chain_results:
+                        if not pts:
+                            continue
+                        _place_objects(props, source_list, pts, tans, has_headtail)
+                        total_count += len(pts)
         finally:
             _is_updating = False
 
@@ -1059,9 +1119,12 @@ class SPLINE_OT_clear(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        props = context.scene.spline_gen
-        _clear_generated(props)
-        self.report({'INFO'}, "已清除生成物")
+        instances = context.scene.spline_gen_instances
+        total = 0
+        for props in instances:
+            _clear_generated(props)
+            total += 1
+        self.report({'INFO'}, f"已清除 {total} 个生成器的物体")
         return {'FINISHED'}
 
 
@@ -1071,7 +1134,9 @@ class SPLINE_OT_add_source_object(bpy.types.Operator):
     bl_options = {'INTERNAL', 'UNDO'}
 
     def execute(self, context):
-        props = context.scene.spline_gen
+        props = _get_active_instance(context)
+        if props is None:
+            return {'CANCELLED'}
         added = 0
         for obj in context.selected_objects:
             if obj.type == 'MESH':
@@ -1098,7 +1163,9 @@ class SPLINE_OT_remove_source_object(bpy.types.Operator):
     index: bpy.props.IntProperty(default=-1)
 
     def execute(self, context):
-        props = context.scene.spline_gen
+        props = _get_active_instance(context)
+        if props is None:
+            return {'CANCELLED'}
         idx = self.index
         if 0 <= idx < len(props.source_objects):
             props.source_objects.remove(idx)
@@ -1118,7 +1185,9 @@ class SPLINE_OT_add_target_curve(bpy.types.Operator):
     bl_options = {'INTERNAL', 'UNDO'}
 
     def execute(self, context):
-        props = context.scene.spline_gen
+        props = _get_active_instance(context)
+        if props is None:
+            return {'CANCELLED'}
         added = 0
         for obj in context.selected_objects:
             if obj.type == 'CURVE':
@@ -1141,7 +1210,9 @@ class SPLINE_OT_remove_target_curve(bpy.types.Operator):
     index: bpy.props.IntProperty(default=-1)
 
     def execute(self, context):
-        props = context.scene.spline_gen
+        props = _get_active_instance(context)
+        if props is None:
+            return {'CANCELLED'}
         idx = self.index
         if 0 <= idx < len(props.target_curves):
             props.target_curves.remove(idx)
@@ -1163,53 +1234,79 @@ class SPLINE_PT_generator_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.spline_gen
+        instances = context.scene.spline_gen_instances
+        active_idx = context.scene.spline_gen_instance_index
+        active_props = _get_active_instance(context)
 
+        # ---- 实例列表 ----
+        box = layout.box()
+        box.label(text="生成器实例", icon='PRESET')
+        col = box.column(align=True)
+        for i, inst in enumerate(instances):
+            row = col.row(align=True)
+            # 选中高亮
+            icon = 'CHECKBOX_HLT' if i == active_idx else 'CHECKBOX_DEHLT'
+            op = row.operator("spline.select_instance", text=inst.name, icon=icon, emboss=(i == active_idx))
+            op.index = i
+            op2 = row.operator("spline.remove_instance", text="", icon='X')
+            op2.index = i
+        row = box.row(align=True)
+        row.operator("spline.add_instance", text="添加生成器", icon='ADD')
+
+        # ---- 全局按钮 ----
         row = layout.row(align=True)
-        row.prop(props, "auto_update", toggle=True, icon='FILE_REFRESH')
-        row.prop(props, "bind_to_curve", toggle=True, icon='CON_SPLINEIK')
-        if not props.auto_update:
-            layout.operator("spline.generate", text="生成")
+        row.prop(active_props, "auto_update", toggle=True, icon='FILE_REFRESH') if active_props else row.label(text="")
+        if active_props:
+            row.prop(active_props, "bind_to_curve", toggle=True, icon='CON_SPLINEIK')
+        layout.operator("spline.generate", text="生成")
+        layout.operator("spline.clear", icon='TRASH')
+
+        if active_props is None:
+            layout.label(text="请添加一个生成器", icon='INFO')
+            return
+
+        # ---- 选中实例的设置 ----
+        layout.separator()
 
         box = layout.box()
-        box.label(text="目标曲线", icon='CURVE_BEZCURVE')
+        box.label(text=f"目标曲线 [{active_props.name}]", icon='CURVE_BEZCURVE')
         col = box.column(align=True)
-        for i, item in enumerate(props.target_curves):
+        for i, item in enumerate(active_props.target_curves):
             row = col.row(align=True)
             row.prop(item, "curve", text="")
             op = row.operator("spline.remove_target_curve", text="", icon='X')
             op.index = i
         row = box.row(align=True)
         row.operator("spline.add_target_curve", text="添加", icon='ADD')
-        if len(props.target_curves) > 0:
-            row.operator("spline.remove_target_curve", text="移除选中").index = props.target_curve_index
+        if len(active_props.target_curves) > 0:
+            row.operator("spline.remove_target_curve", text="移除选中").index = active_props.target_curve_index
 
         box1 = layout.box()
         box1.label(text="模式", icon='OBJECT_DATA')
-        box1.prop(props, "mode", text="")
+        box1.prop(active_props, "mode", text="")
 
-        if props.mode == 'SINGLE':
-            box1.prop(props, "source_object", text="源物体")
+        if active_props.mode == 'SINGLE':
+            box1.prop(active_props, "source_object", text="源物体")
         else:
-            box1.prop(props, "multi_mode", text="")
-            if props.multi_mode == 'HEADTAIL':
+            box1.prop(active_props, "multi_mode", text="")
+            if active_props.multi_mode == 'HEADTAIL':
                 col = box1.column(align=True)
-                col.prop(props, "head_object", text="头部模型")
-                col.prop(props, "head_rotation", text="头部旋转")
-                col.prop(props, "head_scale", text="头部缩放")
+                col.prop(active_props, "head_object", text="头部模型")
+                col.prop(active_props, "head_rotation", text="头部旋转")
+                col.prop(active_props, "head_scale", text="头部缩放")
                 col.separator()
-                col.prop(props, "tail_object", text="尾部模型")
-                col.prop(props, "tail_rotation", text="尾部旋转")
-                col.prop(props, "tail_scale", text="尾部缩放")
+                col.prop(active_props, "tail_object", text="尾部模型")
+                col.prop(active_props, "tail_rotation", text="尾部旋转")
+                col.prop(active_props, "tail_scale", text="尾部缩放")
                 col.separator()
                 col.label(text="首尾偏移（沿曲线比例）:", icon='CON_SPLINEIK')
-                col.prop(props, "head_offset", slider=True)
-                col.prop(props, "tail_offset", slider=True)
+                col.prop(active_props, "head_offset", slider=True)
+                col.prop(active_props, "tail_offset", slider=True)
                 box1.label(text="提示：下方列表为中间的循环物体", icon='INFO')
 
             box1.label(text="循环物体列表:")
             col = box1.column(align=True)
-            for i, item in enumerate(props.source_objects):
+            for i, item in enumerate(active_props.source_objects):
                 row = col.row(align=True)
                 row.prop(item, "object", text="")
                 op = row.operator("spline.remove_source_object", text="", icon='X')
@@ -1217,82 +1314,94 @@ class SPLINE_PT_generator_panel(bpy.types.Panel):
 
             row = box1.row(align=True)
             row.operator("spline.add_source_object", text="添加", icon='ADD')
-            if len(props.source_objects) > 0:
-                row.operator("spline.remove_source_object", text="移除选中").index = props.source_object_index
+            if len(active_props.source_objects) > 0:
+                row.operator("spline.remove_source_object", text="移除选中").index = active_props.source_object_index
 
         box2 = layout.box()
         box2.label(text="分布设置", icon='MOD_ARRAY')
         col = box2.column(align=True)
-        col.prop(props, "count")
-        col.prop(props, "spacing")
-        if not (props.mode == 'MULTI' and props.multi_mode == 'HEADTAIL'):
+        col.prop(active_props, "count")
+        col.prop(active_props, "spacing")
+        if not (active_props.mode == 'MULTI' and active_props.multi_mode == 'HEADTAIL'):
             col.separator()
-            col.prop(props, "offset_start")
-            col.prop(props, "offset_end")
+            col.prop(active_props, "offset_start")
+            col.prop(active_props, "offset_end")
 
         # ---- 偏移面板 ----
         box_offset = layout.box()
         box_offset.label(text="偏移", icon='CON_LOCLIKE')
 
-        if props.mode == 'MULTI' and props.multi_mode == 'HEADTAIL':
+        if active_props.mode == 'MULTI' and active_props.multi_mode == 'HEADTAIL':
             col = box_offset.column(align=True)
             col.label(text="头部模型偏移:", icon='CON_SPLINEIK')
-            col.prop(props, "head_use_offset", toggle=True)
-            if props.head_use_offset:
-                col.prop(props, "head_offset_x")
-                col.prop(props, "head_offset_y")
-                col.prop(props, "head_offset_z")
+            col.prop(active_props, "head_use_offset", toggle=True)
+            if active_props.head_use_offset:
+                col.prop(active_props, "head_offset_x")
+                col.prop(active_props, "head_offset_y")
+                col.prop(active_props, "head_offset_z")
 
             col = box_offset.column(align=True)
             col.label(text="尾部模型偏移:", icon='CON_SPLINEIK')
-            col.prop(props, "tail_use_offset", toggle=True)
-            if props.tail_use_offset:
-                col.prop(props, "tail_offset_x")
-                col.prop(props, "tail_offset_y")
-                col.prop(props, "tail_offset_z")
+            col.prop(active_props, "tail_use_offset", toggle=True)
+            if active_props.tail_use_offset:
+                col.prop(active_props, "tail_offset_x")
+                col.prop(active_props, "tail_offset_y")
+                col.prop(active_props, "tail_offset_z")
 
             col = box_offset.column(align=True)
             col.label(text="循环体偏移:", icon='CON_SPLINEIK')
-            col.prop(props, "loop_use_offset", toggle=True)
-            if props.loop_use_offset:
-                col.prop(props, "loop_offset_x")
-                col.prop(props, "loop_offset_y")
-                col.prop(props, "loop_offset_z")
+            col.prop(active_props, "loop_use_offset", toggle=True)
+            if active_props.loop_use_offset:
+                col.prop(active_props, "loop_offset_x")
+                col.prop(active_props, "loop_offset_y")
+                col.prop(active_props, "loop_offset_z")
         else:
             col = box_offset.column(align=True)
-            col.prop(props, "use_offset", toggle=True)
-            if props.use_offset:
-                col.prop(props, "offset_x")
-                col.prop(props, "offset_y")
-                col.prop(props, "offset_z")
+            col.prop(active_props, "use_offset", toggle=True)
+            if active_props.use_offset:
+                col.prop(active_props, "offset_x")
+                col.prop(active_props, "offset_y")
+                col.prop(active_props, "offset_z")
 
         box3 = layout.box()
         box3.label(text="旋转", icon='ORIENTATION_GIMBAL')
-        box3.prop(props, "follow_curve")
-        box3.prop(props, "random_rotation")
+        box3.prop(active_props, "follow_curve")
+        box3.prop(active_props, "random_rotation")
 
         box4 = layout.box()
         box4.label(text="缩放", icon='FULLSCREEN_ENTER')
-        box4.prop(props, "base_scale")
-        box4.prop(props, "use_random_scale")
-        if props.use_random_scale:
+        box4.prop(active_props, "base_scale")
+        box4.prop(active_props, "use_random_scale")
+        if active_props.use_random_scale:
             col = box4.column(align=True)
-            col.prop(props, "scale_min")
-            col.prop(props, "scale_max")
-            box4.prop(props, "uniform_scale")
+            col.prop(active_props, "scale_min")
+            col.prop(active_props, "scale_max")
+            box4.prop(active_props, "uniform_scale")
 
         box5 = layout.box()
         box5.label(text="克隆", icon='DUPLICATE')
-        box5.prop(props, "linked_duplicate")
-
-        layout.separator()
-        layout.operator("spline.clear", icon='TRASH')
+        box5.prop(active_props, "linked_duplicate")
 
 
 def draw_menu(self, context):
     self.layout.separator()
     self.layout.operator("spline.generate")
     self.layout.operator("spline.clear")
+
+
+# ---------------------------------------------------------------------------
+# 实例选择 Operator
+# ---------------------------------------------------------------------------
+class SPLINE_OT_select_instance(bpy.types.Operator):
+    bl_idname = "spline.select_instance"
+    bl_label = "选择生成器"
+    bl_options = {'INTERNAL'}
+
+    index: bpy.props.IntProperty(default=0)
+
+    def execute(self, context):
+        context.scene.spline_gen_instance_index = self.index
+        return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1412,9 @@ classes = [
     GeneratedObjectItem,
     SplineTargetItem,
     SplineGenProperties,
+    SPLINE_OT_add_instance,
+    SPLINE_OT_remove_instance,
+    SPLINE_OT_select_instance,
     SPLINE_OT_generate,
     SPLINE_OT_clear,
     SPLINE_OT_add_source_object,
@@ -1314,36 +1426,39 @@ classes = [
 
 
 def _migrate_scale_props():
-    """修复从 FloatProperty 迁移到 FloatVectorProperty 后的数据问题。
-    旧版本保存的单值会被映射到向量第一个分量，YZ 分量可能变成 0，
-    导致模型消失或显示异常。
-    """
+    """修复从 FloatProperty 迁移到 FloatVectorProperty 后的数据问题。"""
     for scene in bpy.data.scenes:
-        if not hasattr(scene, 'spline_gen'):
+        if not hasattr(scene, 'spline_gen_instances'):
             continue
-        props = scene.spline_gen
-        for attr_name in ('head_scale', 'tail_scale', 'base_scale'):
-            try:
-                val = getattr(props, attr_name)
-                # 如果 Y 或 Z 分量接近 0（违反 min=0.001），说明是旧数据迁移
-                if val[1] < 0.0001 or val[2] < 0.0001:
-                    # 将 X 的值同步到 YZ，保持用户旧设置的等比缩放
-                    x = max(val[0], 0.001)
-                    setattr(props, attr_name, (x, x, x))
-            except Exception:
-                pass
+        for props in scene.spline_gen_instances:
+            for attr_name in ('head_scale', 'tail_scale', 'base_scale'):
+                try:
+                    val = getattr(props, attr_name)
+                    if val[1] < 0.0001 or val[2] < 0.0001:
+                        x = max(val[0], 0.001)
+                        setattr(props, attr_name, (x, x, x))
+                except Exception:
+                    pass
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.types.Scene.spline_gen = bpy.props.PointerProperty(type=SplineGenProperties)
+    bpy.types.Scene.spline_gen_instances = bpy.props.CollectionProperty(type=SplineGenProperties)
+    bpy.types.Scene.spline_gen_instance_index = bpy.props.IntProperty(default=-1)
 
-    # 修复旧版本数据迁移导致的缩放值异常（延迟到注册完成后执行）
+    # 迁移：自动创建默认实例 + 修复缩放值（延迟到注册完成后执行）
     def _delayed_migrate():
         try:
             _migrate_scale_props()
+            # 自动创建默认实例
+            for scene in bpy.data.scenes:
+                if hasattr(scene, 'spline_gen_instances'):
+                    if len(scene.spline_gen_instances) == 0:
+                        item = scene.spline_gen_instances.add()
+                        item.name = "生成器 1"
+                        scene.spline_gen_instance_index = 0
         except Exception:
             pass
         return None
@@ -1370,7 +1485,9 @@ def unregister():
     _last_curve_state.clear()
 
     bpy.types.VIEW3D_MT_object.remove(draw_menu)
-    del bpy.types.Scene.spline_gen
+
+    del bpy.types.Scene.spline_gen_instances
+    del bpy.types.Scene.spline_gen_instance_index
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
