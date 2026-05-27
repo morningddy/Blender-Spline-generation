@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 13, 1),
+    "version": (1, 13, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多实例、多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -151,6 +151,12 @@ class SplineGenProperties(bpy.types.PropertyGroup):
         name="间距",
         default=0.0, min=0.0, max=10000.0, subtype='DISTANCE',
         description="物体之间的间隔（0 = 沿曲线均匀分布）",
+        update=lambda self, context: _schedule_preview(context),
+    )
+    fill_spline: bpy.props.BoolProperty(
+        name="填满样条线",
+        default=False,
+        description="自动计算间距，将可用区间摆满物体（HEADTAIL 模式排除头尾）",
         update=lambda self, context: _schedule_preview(context),
     )
     offset_start: bpy.props.FloatProperty(
@@ -433,9 +439,11 @@ def _sample_point_on_chain(edge_data, lengths, total_length, dist_on_chain, mat,
 
 
 def sample_curve_by_distance(curve_obj, spacing, max_count,
-                             offset_start=0.0, offset_end=0.0):
+                             offset_start=0.0, offset_end=0.0,
+                             fill_spline=False):
     """对曲线对象的每条样条线独立按距离采样，分段处理。
     每条样条线都应用相同的 spacing/count 参数。
+    fill_spline=True 时，忽略 max_count，按间距把整条样条线摆满。
     返回列表，每个元素是单条链的 (points, tangents)。
     """
     if spacing <= 0.0001:
@@ -470,30 +478,57 @@ def sample_curve_by_distance(curve_obj, spacing, max_count,
         current_dist = start_dist
         count_this_chain = 0
 
-        while current_dist <= end_dist and count_this_chain < max_count:
-            dd = 0.0
-            placed = False
-            for j in range(len(edge_data)):
-                a, b = edge_data[j]
-                L = lengths[j]
-                if L < 0.0001:
+        if fill_spline:
+            # 填满模式：忽略 max_count，一直摆到末尾
+            while current_dist <= end_dist:
+                dd = 0.0
+                placed = False
+                for j in range(len(edge_data)):
+                    a, b = edge_data[j]
+                    L = lengths[j]
+                    if L < 0.0001:
+                        dd += L
+                        continue
+                    if dd + L >= current_dist:
+                        t = (current_dist - dd) / L
+                        pt = a.lerp(b, t)
+                        tan = (b - a).normalized()
+                        pts.append(mat @ pt)
+                        tans.append((mat3 @ tan).normalized())
+                        count_this_chain += 1
+                        placed = True
+                        break
                     dd += L
-                    continue
-                if dd + L >= current_dist:
-                    t = (current_dist - dd) / L
-                    pt = a.lerp(b, t)
-                    tan = (b - a).normalized()
-                    pts.append(mat @ pt)
-                    tans.append((mat3 @ tan).normalized())
-                    count_this_chain += 1
-                    placed = True
+
+                if not placed:
                     break
-                dd += L
 
-            if not placed:
-                break
+                current_dist += spacing
+        else:
+            while current_dist <= end_dist and count_this_chain < max_count:
+                dd = 0.0
+                placed = False
+                for j in range(len(edge_data)):
+                    a, b = edge_data[j]
+                    L = lengths[j]
+                    if L < 0.0001:
+                        dd += L
+                        continue
+                    if dd + L >= current_dist:
+                        t = (current_dist - dd) / L
+                        pt = a.lerp(b, t)
+                        tan = (b - a).normalized()
+                        pts.append(mat @ pt)
+                        tans.append((mat3 @ tan).normalized())
+                        count_this_chain += 1
+                        placed = True
+                        break
+                    dd += L
 
-            current_dist += spacing
+                if not placed:
+                    break
+
+                current_dist += spacing
 
         results.append((pts, tans))
 
@@ -502,10 +537,12 @@ def sample_curve_by_distance(curve_obj, spacing, max_count,
 
 
 def sample_curve_headtail_by_distance(curve_obj, spacing, max_count,
-                                     head_offset=0.0, tail_offset=0.0):
+                                     head_offset=0.0, tail_offset=0.0,
+                                     fill_spline=False):
     """HEADTAIL 模式专用：头尾固定，只调整中间循环体间距。
     头部始终在 head_offset 位置，尾部始终在 (1.0-tail_offset) 位置，
     中间循环体按 spacing 间距放置。
+    fill_spline=True 时，忽略 max_count，按 spacing 把头尾之间摆满。
     """
     deps = bpy.context.evaluated_depsgraph_get()
     eval_obj = curve_obj.evaluated_get(deps)
@@ -542,7 +579,16 @@ def sample_curve_headtail_by_distance(curve_obj, spacing, max_count,
             tans.append(tan_world)
 
         # 中间循环体按间距放置
-        if spacing > 0.0001:
+        if fill_spline and spacing > 0.0001:
+            # 填满模式：忽略 max_count，按间距把头尾之间摆满
+            current_dist = head_dist + spacing
+            while current_dist < tail_dist:
+                pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, current_dist, mat, mat3)
+                if pt_world is not None:
+                    pts.append(pt_world)
+                    tans.append(tan_world)
+                current_dist += spacing
+        elif spacing > 0.0001:
             current_dist = head_dist + spacing
             count_loop = 0
             # max_count 只表示循环体数量（头尾额外固定放置）
@@ -1101,6 +1147,7 @@ class SPLINE_OT_generate(bpy.types.Operator):
                         chain_results = sample_curve_headtail_by_distance(
                             curve, props.spacing, props.count,
                             props.head_offset, props.tail_offset,
+                            fill_spline=props.fill_spline,
                         )
                     else:
                         offset_start = props.offset_start
@@ -1108,6 +1155,7 @@ class SPLINE_OT_generate(bpy.types.Operator):
                         chain_results = sample_curve_by_distance(
                             curve, props.spacing, props.count,
                             offset_start, offset_end,
+                            fill_spline=props.fill_spline,
                         )
                     for pts, tans in chain_results:
                         if not pts:
@@ -1335,6 +1383,9 @@ class SPLINE_PT_generator_panel(bpy.types.Panel):
         col = box2.column(align=True)
         col.prop(active_props, "count")
         col.prop(active_props, "spacing")
+        col.prop(active_props, "fill_spline", toggle=True, icon='ALIGN_CENTER')
+        if active_props.fill_spline:
+            col.label(text="填满模式：按间距摆满可用区间", icon='INFO')
         if not (active_props.mode == 'MULTI' and active_props.multi_mode == 'HEADTAIL'):
             col.separator()
             col.prop(active_props, "offset_start")
