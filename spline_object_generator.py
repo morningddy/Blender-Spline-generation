@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 12, 1),
+    "version": (1, 12, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -1333,8 +1333,14 @@ def register():
 
     bpy.types.Scene.spline_gen = bpy.props.PointerProperty(type=SplineGenProperties)
 
-    # 修复旧版本数据迁移导致的缩放值异常
-    _migrate_scale_props()
+    # 修复旧版本数据迁移导致的缩放值异常（延迟到注册完成后执行）
+    def _delayed_migrate():
+        try:
+            _migrate_scale_props()
+        except Exception:
+            pass
+        return None
+    bpy.app.timers.register(_delayed_migrate, first_interval=0.1)
 
     bpy.types.VIEW3D_MT_object.append(draw_menu)
 
