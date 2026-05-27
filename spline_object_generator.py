@@ -1,10 +1,10 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 11, 0),
+    "version": (1, 12, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
-    "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，可绑定曲线实时跟随",
+    "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
     "category": "Object",
 }
 
@@ -104,10 +104,13 @@ class SplineGenProperties(bpy.types.PropertyGroup):
         description="头部模型的固定旋转（欧拉角）",
         update=lambda self, context: _schedule_preview(context),
     )
-    head_scale: bpy.props.FloatProperty(
+    head_scale: bpy.props.FloatVectorProperty(
         name="头部缩放",
-        default=1.0, min=0.001, max=100.0,
-        description="头部模型的固定缩放",
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        min=0.001, max=100.0,
+        subtype='XYZ',
+        description="头部模型的固定缩放（X, Y, Z 独立）",
         update=lambda self, context: _schedule_preview(context),
     )
     tail_offset: bpy.props.FloatProperty(
@@ -124,10 +127,13 @@ class SplineGenProperties(bpy.types.PropertyGroup):
         description="尾部模型的固定旋转（欧拉角）",
         update=lambda self, context: _schedule_preview(context),
     )
-    tail_scale: bpy.props.FloatProperty(
+    tail_scale: bpy.props.FloatVectorProperty(
         name="尾部缩放",
-        default=1.0, min=0.001, max=100.0,
-        description="尾部模型的固定缩放",
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        min=0.001, max=100.0,
+        subtype='XYZ',
+        description="尾部模型的固定缩放（X, Y, Z 独立）",
         update=lambda self, context: _schedule_preview(context),
     )
 
@@ -167,9 +173,13 @@ class SplineGenProperties(bpy.types.PropertyGroup):
         default=0.0, min=0.0, max=180.0, subtype='ANGLE',
         update=lambda self, context: _schedule_preview(context),
     )
-    base_scale: bpy.props.FloatProperty(
+    base_scale: bpy.props.FloatVectorProperty(
         name="基础缩放",
-        default=1.0, min=0.001, max=100.0,
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        min=0.001, max=100.0,
+        subtype='XYZ',
+        description="循环体的基础缩放（X, Y, Z 独立）",
         update=lambda self, context: _schedule_preview(context),
     )
     use_random_scale: bpy.props.BoolProperty(
@@ -932,28 +942,26 @@ def _place_objects(props, source_list, points, tangents, has_headtail=False):
         is_tail = (has_headtail and i == len(points) - 1 and props.tail_object is not None)
 
         if is_head:
-            # 头部模型：使用独立缩放，不参与随机缩放
-            s = props.head_scale
-            new_obj.scale = (s, s, s)
+            # 头部模型：使用独立三轴缩放，不参与随机缩放
+            new_obj.scale = props.head_scale[:]
         elif is_tail:
-            # 尾部模型：使用独立缩放，不参与随机缩放
-            s = props.tail_scale
-            new_obj.scale = (s, s, s)
+            # 尾部模型：使用独立三轴缩放，不参与随机缩放
+            new_obj.scale = props.tail_scale[:]
         else:
-            # 循环体：使用原有缩放逻辑
+            # 循环体：使用基础三轴缩放，可叠加随机缩放
             bs = props.base_scale
             if props.use_random_scale:
                 if props.uniform_scale:
-                    s = bs * random.uniform(props.scale_min, props.scale_max)
-                    new_obj.scale = (s, s, s)
+                    r = random.uniform(props.scale_min, props.scale_max)
+                    new_obj.scale = (bs[0] * r, bs[1] * r, bs[2] * r)
                 else:
                     new_obj.scale = (
-                        bs * random.uniform(props.scale_min, props.scale_max),
-                        bs * random.uniform(props.scale_min, props.scale_max),
-                        bs * random.uniform(props.scale_min, props.scale_max),
+                        bs[0] * random.uniform(props.scale_min, props.scale_max),
+                        bs[1] * random.uniform(props.scale_min, props.scale_max),
+                        bs[2] * random.uniform(props.scale_min, props.scale_max),
                     )
             else:
-                new_obj.scale = (bs, bs, bs)
+                new_obj.scale = bs[:]
 
     for obj in generated:
         item = props.generated_objects.add()
