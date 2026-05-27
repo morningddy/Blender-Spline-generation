@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 10, 0),
+    "version": (1, 11, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，可绑定曲线实时跟随",
@@ -487,6 +487,73 @@ def sample_curve_by_distance(curve_obj, spacing, max_count,
     return results
 
 
+def sample_curve_headtail_by_distance(curve_obj, spacing, max_count,
+                                     head_offset=0.0, tail_offset=0.0):
+    """HEADTAIL 模式专用：头尾固定，只调整中间循环体间距。
+    头部始终在 head_offset 位置，尾部始终在 (1.0-tail_offset) 位置，
+    中间循环体按 spacing 间距放置。
+    """
+    deps = bpy.context.evaluated_depsgraph_get()
+    eval_obj = curve_obj.evaluated_get(deps)
+    mesh = bpy.data.meshes.new_from_object(eval_obj)
+    mat = curve_obj.matrix_world
+    mat3 = mat.to_3x3()
+
+    chains = _get_all_chains(mesh)
+    if not chains:
+        bpy.data.meshes.remove(mesh)
+        return []
+
+    results = []
+
+    for chain in chains:
+        result = _sample_chain(mesh, chain, mat, mat3)
+        if result is None:
+            continue
+        edge_data, lengths, total_length = result
+
+        # 头尾固定位置
+        head_dist = total_length * head_offset
+        tail_dist = total_length * (1.0 - tail_offset)
+        if tail_dist <= head_dist:
+            continue
+
+        pts = []
+        tans = []
+
+        # 头部固定
+        pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, head_dist, mat, mat3)
+        if pt_world is not None:
+            pts.append(pt_world)
+            tans.append(tan_world)
+
+        # 中间循环体按间距放置
+        if spacing > 0.0001:
+            current_dist = head_dist + spacing
+            count_loop = 0
+            # 最多放置 max_count-2 个中间物体（减去头尾）
+            while current_dist < tail_dist and count_loop < max_count - 2:
+                pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, current_dist, mat, mat3)
+                if pt_world is not None:
+                    pts.append(pt_world)
+                    tans.append(tan_world)
+                    count_loop += 1
+                current_dist += spacing
+
+        # 尾部固定
+        pt_world, tan_world = _sample_point_on_chain(edge_data, lengths, total_length, tail_dist, mat, mat3)
+        if pt_world is not None:
+            # 避免与头部重合
+            if len(pts) == 0 or (pt_world - pts[-1]).length > 0.0001:
+                pts.append(pt_world)
+                tans.append(tan_world)
+
+        results.append((pts, tans))
+
+    bpy.data.meshes.remove(mesh)
+    return results
+
+
 def sample_curve(curve_obj, count, offset_start=0.0, offset_end=0.0):
     """对曲线对象的每条样条线独立均匀采样 count 个点，分段处理。
     每条样条线采样 count 个点（不是总共 count 个）。
@@ -750,15 +817,18 @@ def _generate_direct():
             _clear_generated(props)
             total_count = 0
             for curve in curves:
-                offset_start = props.offset_start
-                offset_end = props.offset_end
                 if has_headtail:
-                    offset_start = props.head_offset
-                    offset_end = props.tail_offset
-                chain_results = sample_curve_by_distance(
-                    curve, props.spacing, props.count,
-                    offset_start, offset_end,
-                )
+                    chain_results = sample_curve_headtail_by_distance(
+                        curve, props.spacing, props.count,
+                        props.head_offset, props.tail_offset,
+                    )
+                else:
+                    offset_start = props.offset_start
+                    offset_end = props.offset_end
+                    chain_results = sample_curve_by_distance(
+                        curve, props.spacing, props.count,
+                        offset_start, offset_end,
+                    )
                 for pts, tans in chain_results:
                     if not pts:
                         continue
@@ -938,16 +1008,18 @@ class SPLINE_OT_generate(bpy.types.Operator):
             _clear_generated(props)
             total_count = 0
             for curve in curves:
-                offset_start = props.offset_start
-                offset_end = props.offset_end
                 if has_headtail:
-                    offset_start = props.head_offset
-                    offset_end = props.tail_offset
-
-                chain_results = sample_curve_by_distance(
-                    curve, props.spacing, props.count,
-                    offset_start, offset_end,
-                )
+                    chain_results = sample_curve_headtail_by_distance(
+                        curve, props.spacing, props.count,
+                        props.head_offset, props.tail_offset,
+                    )
+                else:
+                    offset_start = props.offset_start
+                    offset_end = props.offset_end
+                    chain_results = sample_curve_by_distance(
+                        curve, props.spacing, props.count,
+                        offset_start, offset_end,
+                    )
 
                 for pts, tans in chain_results:
                     if not pts:
