@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 13, 2),
+    "version": (1, 13, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多实例、多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -156,7 +156,7 @@ class SplineGenProperties(bpy.types.PropertyGroup):
     fill_spline: bpy.props.BoolProperty(
         name="填满样条线",
         default=False,
-        description="自动计算间距，将可用区间摆满物体（HEADTAIL 模式排除头尾）",
+        description="自动按源物体尺寸计算间距，将可用区间摆满（HEADTAIL 模式排除头尾）",
         update=lambda self, context: _schedule_preview(context),
     )
     offset_start: bpy.props.FloatProperty(
@@ -1130,6 +1130,18 @@ class SPLINE_OT_generate(bpy.types.Operator):
 
         _is_updating = True
         total_count = 0
+
+        def _get_source_size(source_list):
+            """从源物体列表中找出最大的边界框边长。"""
+            max_size = 0.0
+            for obj in source_list:
+                if obj and obj.type == 'MESH':
+                    dims = obj.dimensions
+                    size = max(dims.x, dims.y, dims.z)
+                    if size > max_size:
+                        max_size = size
+            return max_size if max_size > 0.0001 else 1.0
+
         try:
             for props in instances:
                 curves = [item.curve for item in props.target_curves
@@ -1141,11 +1153,16 @@ class SPLINE_OT_generate(bpy.types.Operator):
                     continue
                 source_list, has_headtail = result
 
+                # 填满模式：自动使用源物体尺寸作为间距
+                effective_spacing = props.spacing
+                if props.fill_spline:
+                    effective_spacing = _get_source_size(source_list)
+
                 _clear_generated(props)
                 for curve in curves:
                     if has_headtail:
                         chain_results = sample_curve_headtail_by_distance(
-                            curve, props.spacing, props.count,
+                            curve, effective_spacing, props.count,
                             props.head_offset, props.tail_offset,
                             fill_spline=props.fill_spline,
                         )
@@ -1153,7 +1170,7 @@ class SPLINE_OT_generate(bpy.types.Operator):
                         offset_start = props.offset_start
                         offset_end = props.offset_end
                         chain_results = sample_curve_by_distance(
-                            curve, props.spacing, props.count,
+                            curve, effective_spacing, props.count,
                             offset_start, offset_end,
                             fill_spline=props.fill_spline,
                         )
@@ -1385,7 +1402,7 @@ class SPLINE_PT_generator_panel(bpy.types.Panel):
         col.prop(active_props, "spacing")
         col.prop(active_props, "fill_spline", toggle=True, icon='ALIGN_CENTER')
         if active_props.fill_spline:
-            col.label(text="填满模式：按间距摆满可用区间", icon='INFO')
+            col.label(text="自动按源物体尺寸计算间距摆满", icon='INFO')
         if not (active_props.mode == 'MULTI' and active_props.multi_mode == 'HEADTAIL'):
             col.separator()
             col.prop(active_props, "offset_start")
