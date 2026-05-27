@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 9, 0),
+    "version": (1, 10, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，可绑定曲线实时跟随",
@@ -97,11 +97,37 @@ class SplineGenProperties(bpy.types.PropertyGroup):
         description="头部模型沿曲线向下的偏移比例（0=曲线起点）",
         update=lambda self, context: _schedule_preview(context),
     )
+    head_rotation: bpy.props.FloatVectorProperty(
+        name="头部旋转",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        description="头部模型的固定旋转（欧拉角）",
+        update=lambda self, context: _schedule_preview(context),
+    )
+    head_scale: bpy.props.FloatProperty(
+        name="头部缩放",
+        default=1.0, min=0.001, max=100.0,
+        description="头部模型的固定缩放",
+        update=lambda self, context: _schedule_preview(context),
+    )
     tail_offset: bpy.props.FloatProperty(
         name="尾部偏移",
         default=0.0, min=0.0, max=0.99,
         subtype='FACTOR',
         description="尾部模型沿曲线向上的偏移比例（0=曲线终点）",
+        update=lambda self, context: _schedule_preview(context),
+    )
+    tail_rotation: bpy.props.FloatVectorProperty(
+        name="尾部旋转",
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        description="尾部模型的固定旋转（欧拉角）",
+        update=lambda self, context: _schedule_preview(context),
+    )
+    tail_scale: bpy.props.FloatProperty(
+        name="尾部缩放",
+        default=1.0, min=0.001, max=100.0,
+        description="尾部模型的固定缩放",
         update=lambda self, context: _schedule_preview(context),
     )
 
@@ -776,7 +802,18 @@ def _place_objects(props, source_list, points, tangents, has_headtail=False):
         else:
             final_quat = use_src.rotation_quaternion.copy()
 
-        if props.random_rotation > 0:
+        is_head = (has_headtail and i == 0 and props.head_object is not None)
+        is_tail = (has_headtail and i == len(points) - 1 and props.tail_object is not None)
+
+        if is_head:
+            # 头部模型：应用固定旋转，不参与随机旋转
+            head_euler = Euler(props.head_rotation)
+            final_quat = final_quat @ head_euler.to_quaternion()
+        elif is_tail:
+            # 尾部模型：应用固定旋转，不参与随机旋转
+            tail_euler = Euler(props.tail_rotation)
+            final_quat = final_quat @ tail_euler.to_quaternion()
+        elif props.random_rotation > 0:
             rand_q = _random_rotation(math.radians(props.random_rotation))
             final_quat = final_quat @ rand_q
 
@@ -821,19 +858,32 @@ def _place_objects(props, source_list, points, tangents, has_headtail=False):
         generated.append(new_obj)
 
         # ③ 缩放
-        bs = props.base_scale
-        if props.use_random_scale:
-            if props.uniform_scale:
-                s = bs * random.uniform(props.scale_min, props.scale_max)
-                new_obj.scale = (s, s, s)
-            else:
-                new_obj.scale = (
-                    bs * random.uniform(props.scale_min, props.scale_max),
-                    bs * random.uniform(props.scale_min, props.scale_max),
-                    bs * random.uniform(props.scale_min, props.scale_max),
-                )
+        is_head = (has_headtail and i == 0 and props.head_object is not None)
+        is_tail = (has_headtail and i == len(points) - 1 and props.tail_object is not None)
+
+        if is_head:
+            # 头部模型：使用独立缩放，不参与随机缩放
+            s = props.head_scale
+            new_obj.scale = (s, s, s)
+        elif is_tail:
+            # 尾部模型：使用独立缩放，不参与随机缩放
+            s = props.tail_scale
+            new_obj.scale = (s, s, s)
         else:
-            new_obj.scale = (bs, bs, bs)
+            # 循环体：使用原有缩放逻辑
+            bs = props.base_scale
+            if props.use_random_scale:
+                if props.uniform_scale:
+                    s = bs * random.uniform(props.scale_min, props.scale_max)
+                    new_obj.scale = (s, s, s)
+                else:
+                    new_obj.scale = (
+                        bs * random.uniform(props.scale_min, props.scale_max),
+                        bs * random.uniform(props.scale_min, props.scale_max),
+                        bs * random.uniform(props.scale_min, props.scale_max),
+                    )
+            else:
+                new_obj.scale = (bs, bs, bs)
 
     for obj in generated:
         item = props.generated_objects.add()
@@ -1058,7 +1108,12 @@ class SPLINE_PT_generator_panel(bpy.types.Panel):
             if props.multi_mode == 'HEADTAIL':
                 col = box1.column(align=True)
                 col.prop(props, "head_object", text="头部模型")
+                col.prop(props, "head_rotation", text="头部旋转")
+                col.prop(props, "head_scale", text="头部缩放")
+                col.separator()
                 col.prop(props, "tail_object", text="尾部模型")
+                col.prop(props, "tail_rotation", text="尾部旋转")
+                col.prop(props, "tail_scale", text="尾部缩放")
                 col.separator()
                 col.label(text="首尾偏移（沿曲线比例）:", icon='CON_SPLINEIK')
                 col.prop(props, "head_offset", slider=True)
