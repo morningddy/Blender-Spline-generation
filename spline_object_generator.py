@@ -12,7 +12,7 @@ import bpy
 import math
 import random
 import hashlib
-from mathutils import Vector, Matrix, Quaternion
+from mathutils import Vector, Matrix, Quaternion, Euler
 
 
 # ---------------------------------------------------------------------------
