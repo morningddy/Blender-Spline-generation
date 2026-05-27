@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 13, 3),
+    "version": (1, 13, 4),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多实例、多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -912,6 +912,18 @@ def _generate_direct(selected_only=False):
         break
 
 
+def _get_source_size(source_list):
+    """从源物体列表中找出最大的边界框边长。"""
+    max_size = 0.0
+    for obj in source_list:
+        if obj and obj.type == 'MESH':
+            dims = obj.dimensions
+            size = max(dims.x, dims.y, dims.z)
+            if size > max_size:
+                max_size = size
+    return max_size if max_size > 0.0001 else 1.0
+
+
 def _generate_for_instance(props):
     """对单个生成器实例执行生成。"""
     curves = [item.curve for item in props.target_curves
@@ -923,20 +935,27 @@ def _generate_for_instance(props):
         return
     source_list, has_headtail = result
 
+    # 填满模式：自动使用源物体尺寸作为间距
+    effective_spacing = props.spacing
+    if props.fill_spline:
+        effective_spacing = _get_source_size(source_list)
+
     _clear_generated(props)
     total_count = 0
     for curve in curves:
         if has_headtail:
             chain_results = sample_curve_headtail_by_distance(
-                curve, props.spacing, props.count,
+                curve, effective_spacing, props.count,
                 props.head_offset, props.tail_offset,
+                fill_spline=props.fill_spline,
             )
         else:
             offset_start = props.offset_start
             offset_end = props.offset_end
             chain_results = sample_curve_by_distance(
-                curve, props.spacing, props.count,
+                curve, effective_spacing, props.count,
                 offset_start, offset_end,
+                fill_spline=props.fill_spline,
             )
         for pts, tans in chain_results:
             if not pts:
@@ -1130,17 +1149,6 @@ class SPLINE_OT_generate(bpy.types.Operator):
 
         _is_updating = True
         total_count = 0
-
-        def _get_source_size(source_list):
-            """从源物体列表中找出最大的边界框边长。"""
-            max_size = 0.0
-            for obj in source_list:
-                if obj and obj.type == 'MESH':
-                    dims = obj.dimensions
-                    size = max(dims.x, dims.y, dims.z)
-                    if size > max_size:
-                        max_size = size
-            return max_size if max_size > 0.0001 else 1.0
 
         try:
             for props in instances:
