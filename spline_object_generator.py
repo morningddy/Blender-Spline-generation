@@ -1,7 +1,7 @@
 bl_info = {
     "name": "样条线生成器",
     "author": "Your Name",
-    "version": (1, 12, 0),
+    "version": (1, 12, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 样条线生成",
     "description": "沿样条线实时生成物体，支持多段样条线分段处理，支持缩放、间距、旋转与首尾模型，头部/尾部/基础缩放均支持三轴独立控制，可绑定曲线实时跟随",
@@ -1306,11 +1306,36 @@ classes = [
 ]
 
 
+def _migrate_scale_props():
+    """修复从 FloatProperty 迁移到 FloatVectorProperty 后的数据问题。
+    旧版本保存的单值会被映射到向量第一个分量，YZ 分量可能变成 0，
+    导致模型消失或显示异常。
+    """
+    for scene in bpy.data.scenes:
+        if not hasattr(scene, 'spline_gen'):
+            continue
+        props = scene.spline_gen
+        for attr_name in ('head_scale', 'tail_scale', 'base_scale'):
+            try:
+                val = getattr(props, attr_name)
+                # 如果 Y 或 Z 分量接近 0（违反 min=0.001），说明是旧数据迁移
+                if val[1] < 0.0001 or val[2] < 0.0001:
+                    # 将 X 的值同步到 YZ，保持用户旧设置的等比缩放
+                    x = max(val[0], 0.001)
+                    setattr(props, attr_name, (x, x, x))
+            except Exception:
+                pass
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.spline_gen = bpy.props.PointerProperty(type=SplineGenProperties)
+
+    # 修复旧版本数据迁移导致的缩放值异常
+    _migrate_scale_props()
+
     bpy.types.VIEW3D_MT_object.append(draw_menu)
 
     global _bind_timer_active
