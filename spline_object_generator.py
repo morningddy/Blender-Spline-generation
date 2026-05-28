@@ -291,6 +291,7 @@ def _get_curve_state_hash(curve_obj):
     try:
         data = curve_obj.data
         h = hashlib.md5()
+        # 采样曲线局部坐标
         for spline in data.splines:
             h.update(spline.type.encode())
             if spline.type == 'BEZIER':
@@ -301,6 +302,11 @@ def _get_curve_state_hash(curve_obj):
                 for p in spline.points:
                     h.update(f"{p.co.x:.4f},{p.co.y:.4f},{p.co.z:.4f},{p.co.w:.4f}".encode())
         h.update(f"resolu:{data.resolution_u}".encode())
+        # 采样物体世界变换矩阵（检测物体模式下的移动/旋转/缩放）
+        mw = curve_obj.matrix_world
+        for i in range(4):
+            for j in range(4):
+                h.update(f"{mw[i][j]:.6f}".encode())
         return h.hexdigest()
     except Exception:
         return None
@@ -529,6 +535,12 @@ def _on_bind_toggle(context):
     global _bind_timer_active
     if props.bind_to_curve:
         _last_curve_state.clear()
+        # 开启绑定时立即记录当前曲线状态
+        curve = props.target_curve
+        if curve is not None and curve.type == 'CURVE':
+            h = _get_curve_state_hash(curve)
+            if h is not None:
+                _last_curve_state[curve.name] = h
         _bind_timer_active = True
     else:
         _bind_timer_active = False
@@ -547,25 +559,32 @@ def _bind_timer_callback():
         if not hasattr(scene, 'spline_gen'):
             continue
         props = scene.spline_gen
+        # 自我修正：如果面板显示绑定但实际状态不一致，同步状态
+        if props.bind_to_curve and not _bind_timer_active:
+            _bind_timer_active = True
+        elif not props.bind_to_curve and _bind_timer_active:
+            _bind_timer_active = False
+            return 0.1
         if not props.bind_to_curve or props.target_curve is None:
             continue
         curve = props.target_curve
         if curve.type != 'CURVE':
             continue
         new_hash = _get_curve_state_hash(curve)
-        obj_id = curve.as_pointer()
-        old_hash = _last_curve_state.get(obj_id)
+        obj_key = curve.name
+        old_hash = _last_curve_state.get(obj_key)
         if new_hash is not None and new_hash != old_hash:
-            _last_curve_state[obj_id] = new_hash
+            _last_curve_state[obj_key] = new_hash
             def _delayed_gen():
                 try:
                     _generate_direct()
                 except Exception:
                     pass
                 return None
-            bpy.app.timers.register(_delayed_gen, first_interval=0.05)
+            bpy.app.timers.register(_delayed_gen, first_interval=0.03)
+        # 清理不存在的曲线记录
         _last_curve_state = {k: v for k, v in _last_curve_state.items()
-                                 if bpy.data.objects.get(str(k)) is not None}
+                                 if k in bpy.data.objects}
     return 0.1
 
 
@@ -586,24 +605,19 @@ def _collect_source(props):
 
 
 def _clear_generated(props):
-    global _is_updating
-    _is_updating = True
-    try:
-        to_remove = [item.name for item in props.generated_objects]
-        for name in to_remove:
-            obj = bpy.data.objects.get(name)
-            if obj is not None:
-                mesh = obj.data
-                bpy.data.objects.remove(obj, do_unlink=True)
-                if mesh and mesh.users == 0:
-                    try:
-                        if hasattr(mesh, 'type') and mesh.type == 'MESH':
-                            bpy.data.meshes.remove(mesh)
-                    except Exception:
-                        pass
-        props.generated_objects.clear()
-    finally:
-        _is_updating = False
+    to_remove = [item.name for item in props.generated_objects]
+    for name in to_remove:
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            mesh = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh and mesh.users == 0:
+                try:
+                    if hasattr(mesh, 'type') and mesh.type == 'MESH':
+                        bpy.data.meshes.remove(mesh)
+                except Exception:
+                    pass
+    props.generated_objects.clear()
 
 
 def _generate_direct():
@@ -650,7 +664,6 @@ def _generate_direct():
             _place_objects(props, source_list, points, tangents, has_headtail)
         finally:
             _is_updating = False
-        break
 
 
 def _place_objects(props, source_list, points, tangents, has_headtail=False):
@@ -1059,7 +1072,12 @@ def register():
     bpy.types.VIEW3D_MT_object.append(draw_menu)
 
     global _bind_timer_active
+    # 恢复已有场景的绑定状态
     _bind_timer_active = False
+    for scene in bpy.data.scenes:
+        if hasattr(scene, 'spline_gen') and scene.spline_gen.bind_to_curve:
+            _bind_timer_active = True
+            break
     bpy.app.timers.register(_bind_timer_callback, first_interval=0.2)
 
 
