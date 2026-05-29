@@ -1,3 +1,7 @@
+节点操作及功能：[<img width="1912" height="922" alt="image" src="https://github.com/user-attachments/assets/b3681249-530c-42c4-9df5-912d6e10e5f0" />](https://www.bilibili.com/video/BV1SpVW6QEjm/?vd_source=37cc0280bd306087f2b48ebfc98362cf)
+
+
+
 # Blender 样条线生成器
 
 沿样条线实时生成物体的 Blender 插件，支持缩放、间距、旋转与首尾模型，可绑定曲线实时跟随。
